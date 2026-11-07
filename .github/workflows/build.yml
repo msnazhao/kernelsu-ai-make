@@ -6,8 +6,11 @@ on:
     - cron: "0 0 * * 5"
 
 permissions:
-  contents: read
-  actions: write
+  contents: write
+
+concurrency:
+  group: kernelsu-release-build
+  cancel-in-progress: false
 
 jobs:
   check-release:
@@ -20,14 +23,17 @@ jobs:
         id: latest
         shell: bash
         env:
-          PREVIOUS_TAG: ${{ vars.LATEST_KERNELSU_RELEASE }}
+          GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          set -euo pipefail
           tag="$(curl -fsSL https://api.github.com/repos/tiann/KernelSU/releases/latest | jq -er '.tag_name')"
+          state="$(gh api "repos/${GITHUB_REPOSITORY}/contents/.github/last-upstream-release" 2>/dev/null || true)"
+          previous_tag="$(jq -r '.content // empty' <<< "$state" | base64 --decode 2>/dev/null || true)"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$tag" != "$PREVIOUS_TAG" ]]; then
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$tag" != "$previous_tag" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "Building new/manual KernelSU release: $tag"
+            echo "Building new/manual KernelSU release: $tag (last built: ${previous_tag:-none})"
           else
             echo "should_build=false" >> "$GITHUB_OUTPUT"
             echo "KernelSU $tag was already built; skipping."
@@ -88,4 +94,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
-        run: gh variable set LATEST_KERNELSU_RELEASE --body "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="repos/${GITHUB_REPOSITORY}/contents/.github/last-upstream-release"
+          state="$(gh api "$api" 2>/dev/null || true)"
+          previous_tag="$(jq -r '.content // empty' <<< "$state" | base64 --decode 2>/dev/null || true)"
+          if [[ "$previous_tag" == "$RELEASE_TAG" ]]; then
+            echo "Release marker already records $RELEASE_TAG; no update needed."
+            exit 0
+          fi
+          encoded_tag="$(printf '%s' "$RELEASE_TAG" | base64 --wrap=0)"
+          if sha="$(jq -er '.sha' <<< "$state" 2>/dev/null)"; then
+            gh api --method PUT "$api" \
+              -f message="Record built KernelSU release $RELEASE_TAG" \
+              -f content="$encoded_tag" -f branch=main -f sha="$sha" >/dev/null
+          else
+            gh api --method PUT "$api" \
+              -f message="Record built KernelSU release $RELEASE_TAG" \
+              -f content="$encoded_tag" -f branch=main >/dev/null
+          fi
