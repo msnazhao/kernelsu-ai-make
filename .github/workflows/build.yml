@@ -29,7 +29,7 @@ jobs:
           set -euo pipefail
           tag="$(curl -fsSL https://api.github.com/repos/tiann/KernelSU/releases/latest | jq -er '.tag_name')"
           release="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets 2>/dev/null || true)"
-          has_apk="$(jq -r '[.assets[]? | select((.name // "") | test("v.+_[0-9]+-.*\\.apk$"))] | length > 0' <<< "$release" 2>/dev/null || true)"
+          has_apk="$(jq -r '[.assets[]? | select((.name // "") | test("v.+_[0-9]+-ksud\\.apk$"))] | length > 0' <<< "$release" 2>/dev/null || true)"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if [[ "$EVENT_NAME" == "workflow_dispatch" || "$has_apk" != "true" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
@@ -50,6 +50,20 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
         run: git clone --branch "$RELEASE_TAG" https://github.com/tiann/KernelSU.git source
+      - name: Download matching upstream ksud binaries
+        env:
+          RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in aarch64-linux-android x86_64-linux-android riscv64-linux-android; do
+            destination="source/target/$target/release/ksud"
+            mkdir -p "$(dirname "$destination")"
+            curl -fsSL --retry 3 \
+              "https://github.com/tiann/KernelSU/releases/download/${RELEASE_TAG}/ksud-${target}" \
+              -o "$destination"
+            test -s "$destination"
+          done
       - name: Patch manager update channel
         run: git -C source apply ../patches/kernelsu-update-channel.patch
 
@@ -87,20 +101,50 @@ jobs:
         working-directory: source/manager
         run: ./gradlew --no-daemon clean assembleRelease -PKSU_PACKAGE_NAME=ai.make.kernels -PKSU_NAME=kernels
 
-      - name: Prepare APK for release
+      - name: Repack manager with matching ksud binaries
         id: apk
         env:
-          RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
           source_apk="$(find source/manager/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
           test -n "$source_apk"
+          gradle_name="$(basename "$source_apk" .apk)"
+          output_name="${gradle_name%-release}-ksud"
+          python3 source/repack_apk.py repack \
+            -b release \
+            -t release \
+            -a arm64-v8a \
+            -a x86_64 \
+            -a riscv64 \
+            -K manager/release.jks \
+            -A "$KEY_ALIAS" \
+            -P "$KEYSTORE_PASSWORD" \
+            -S "$KEY_PASSWORD" \
+            -n "$output_name"
+
           mkdir -p release
-          apk_name="$(basename "$source_apk")"
-          [[ "$apk_name" =~ v.+_[0-9]+-.*\.apk$ ]] || { echo "APK name does not include version name and code: $apk_name" >&2; exit 1; }
-          apk_path="release/$apk_name"
-          cp "$source_apk" "$apk_path"
+          apk_path="release/${output_name}.apk"
+          cp "source/dist/${output_name}.apk" "$apk_path"
+          python3 - "$apk_path" <<'PY'
+          import sys
+          from zipfile import ZipFile
+
+          apk = sys.argv[1]
+          required = {
+              "lib/arm64-v8a/libksud.so",
+              "lib/x86_64/libksud.so",
+              "lib/riscv64/libksud.so",
+          }
+          with ZipFile(apk) as package:
+              missing = required.difference(package.namelist())
+          if missing:
+              raise SystemExit(f"APK missing required ksud libraries: {sorted(missing)}")
+          print(f"Verified ksud libraries in {apk}")
+          PY
           echo "path=$apk_path" >> "$GITHUB_OUTPUT"
 
       - name: Create or update GitHub Release
