@@ -29,7 +29,7 @@ jobs:
           set -euo pipefail
           tag="$(curl -fsSL https://api.github.com/repos/tiann/KernelSU/releases/latest | jq -er '.tag_name')"
           release="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets 2>/dev/null || true)"
-          has_apk="$(jq -er '[.assets[]? | select((.name // "") | endswith(".apk"))] | length > 0' <<< "$release" 2>/dev/null || printf 'false')"
+          has_apk="$(jq -r '[.assets[]? | select((.name // "") | test("v.+_[0-9]+-.*\\.apk$"))] | length > 0' <<< "$release" 2>/dev/null || true)"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if [[ "$EVENT_NAME" == "workflow_dispatch" || "$has_apk" != "true" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
@@ -44,10 +44,14 @@ jobs:
     if: needs.check-release.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout build configuration and patches
+        uses: actions/checkout@v7
       - name: Download release source
         env:
           RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
-        run: git clone --depth 1 --branch "$RELEASE_TAG" https://github.com/tiann/KernelSU.git source
+        run: git clone --branch "$RELEASE_TAG" https://github.com/tiann/KernelSU.git source
+      - name: Patch manager update channel
+        run: git -C source apply ../patches/kernelsu-update-channel.patch
 
       - name: Configure signing keystore
         working-directory: source/manager
@@ -71,13 +75,13 @@ jobs:
           } >> gradle.properties
 
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Build signed APK with custom package and app names
         working-directory: source/manager
@@ -93,7 +97,9 @@ jobs:
           source_apk="$(find source/manager/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
           test -n "$source_apk"
           mkdir -p release
-          apk_path="release/kernels-${RELEASE_TAG}-ai.make.kernels.apk"
+          apk_name="$(basename "$source_apk")"
+          [[ "$apk_name" =~ v.+_[0-9]+-.*\.apk$ ]] || { echo "APK name does not include version name and code: $apk_name" >&2; exit 1; }
+          apk_path="release/$apk_name"
           cp "$source_apk" "$apk_path"
           echo "path=$apk_path" >> "$GITHUB_OUTPUT"
 
@@ -106,6 +112,11 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            existing_apks="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | select(.name | endswith(".apk")) | .name')"
+            while IFS= read -r old_apk; do
+              [[ -n "$old_apk" && "$old_apk" != "$(basename "$APK_PATH")" ]] || continue
+              gh release delete-asset "$RELEASE_TAG" "$old_apk" --repo "$GITHUB_REPOSITORY" --yes
+            done <<< "$existing_apks"
             gh release upload "$RELEASE_TAG" "$APK_PATH" --repo "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$RELEASE_TAG" "$APK_PATH" \
