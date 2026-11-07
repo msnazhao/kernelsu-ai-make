@@ -19,7 +19,7 @@ jobs:
       tag: ${{ steps.latest.outputs.tag }}
       should_build: ${{ steps.latest.outputs.should_build }}
     steps:
-      - name: Check upstream latest release
+      - name: Check upstream release
         id: latest
         shell: bash
         env:
@@ -28,15 +28,15 @@ jobs:
         run: |
           set -euo pipefail
           tag="$(curl -fsSL https://api.github.com/repos/tiann/KernelSU/releases/latest | jq -er '.tag_name')"
-          state="$(gh api "repos/${GITHUB_REPOSITORY}/contents/.github/last-upstream-release" 2>/dev/null || true)"
-          previous_tag="$(jq -r '.content // empty' <<< "$state" | base64 --decode 2>/dev/null || true)"
+          release="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets 2>/dev/null || true)"
+          has_apk="$(jq -er '[.assets[]? | select((.name // "") | endswith(".apk"))] | length > 0' <<< "$release" 2>/dev/null || printf 'false')"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$tag" != "$previous_tag" ]]; then
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$has_apk" != "true" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "Building new/manual KernelSU release: $tag (last built: ${previous_tag:-none})"
+            echo "Building KernelSU $tag (release APK present: $has_apk)"
           else
             echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "KernelSU $tag was already built; skipping."
+            echo "Release $tag already has an APK; skipping."
           fi
 
   build:
@@ -83,34 +83,42 @@ jobs:
         working-directory: source/manager
         run: ./gradlew --no-daemon clean assembleRelease -PKSU_PACKAGE_NAME=ai.make.kernels -PKSU_NAME=kernels
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernels-${{ needs.check-release.outputs.tag }}-ai.make.kernels
-          path: source/manager/app/build/outputs/apk/release/*.apk
-          if-no-files-found: error
-          retention-days: 30
-      - name: Save successfully built release
+      - name: Prepare APK for release
+        id: apk
         env:
-          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
-          api="repos/${GITHUB_REPOSITORY}/contents/.github/last-upstream-release"
-          state="$(gh api "$api" 2>/dev/null || true)"
-          previous_tag="$(jq -r '.content // empty' <<< "$state" | base64 --decode 2>/dev/null || true)"
-          if [[ "$previous_tag" == "$RELEASE_TAG" ]]; then
-            echo "Release marker already records $RELEASE_TAG; no update needed."
-            exit 0
-          fi
-          encoded_tag="$(printf '%s' "$RELEASE_TAG" | base64 --wrap=0)"
-          if sha="$(jq -er '.sha' <<< "$state" 2>/dev/null)"; then
-            gh api --method PUT "$api" \
-              -f message="Record built KernelSU release $RELEASE_TAG" \
-              -f content="$encoded_tag" -f branch=main -f sha="$sha" >/dev/null
+          source_apk="$(find source/manager/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$source_apk"
+          mkdir -p release
+          apk_path="release/kernels-${RELEASE_TAG}-ai.make.kernels.apk"
+          cp "$source_apk" "$apk_path"
+          echo "path=$apk_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernels-${{ needs.check-release.outputs.tag }}-ai.make.kernels
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$APK_PATH" --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh api --method PUT "$api" \
-              -f message="Record built KernelSU release $RELEASE_TAG" \
-              -f content="$encoded_tag" -f branch=main >/dev/null
+            gh release create "$RELEASE_TAG" "$APK_PATH" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target main \
+              --title "KernelSU $RELEASE_TAG (kernels)" \
+              --notes "Built from tiann/KernelSU $RELEASE_TAG. Package: ai.make.kernels."
           fi
