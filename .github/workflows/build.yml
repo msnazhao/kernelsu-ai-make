@@ -1,0 +1,91 @@
+name: Build signed KernelSU Manager
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * 5"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.latest.outputs.tag }}
+      should_build: ${{ steps.latest.outputs.should_build }}
+    steps:
+      - name: Check upstream latest release
+        id: latest
+        shell: bash
+        env:
+          PREVIOUS_TAG: ${{ vars.LATEST_KERNELSU_RELEASE }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          tag="$(curl -fsSL https://api.github.com/repos/tiann/KernelSU/releases/latest | jq -er '.tag_name')"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$tag" != "$PREVIOUS_TAG" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Building new/manual KernelSU release: $tag"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "KernelSU $tag was already built; skipping."
+          fi
+
+  build:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release source
+        env:
+          RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
+        run: git clone --depth 1 --branch "$RELEASE_TAG" https://github.com/tiann/KernelSU.git source
+
+      - name: Configure signing keystore
+        working-directory: source/manager
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        shell: bash
+        run: |
+          test -n "$KEYSTORE_BASE64" || { echo "Missing repository secret: KEYSTORE" >&2; exit 1; }
+          test -n "$KEYSTORE_PASSWORD" || { echo "Missing repository secret: KEYSTORE_PASSWORD" >&2; exit 1; }
+          test -n "$KEY_ALIAS" || { echo "Missing repository secret: KEY_ALIAS" >&2; exit 1; }
+          test -n "$KEY_PASSWORD" || { echo "Missing repository secret: KEY_PASSWORD" >&2; exit 1; }
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > release.jks
+          {
+            printf 'KEYSTORE_FILE=release.jks\n'
+            printf 'KEYSTORE_PASSWORD=%s\n' "$KEYSTORE_PASSWORD"
+            printf 'KEY_ALIAS=%s\n' "$KEY_ALIAS"
+            printf 'KEY_PASSWORD=%s\n' "$KEY_PASSWORD"
+          } >> gradle.properties
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build signed APK with custom package and app names
+        working-directory: source/manager
+        run: ./gradlew --no-daemon clean assembleRelease -PKSU_PACKAGE_NAME=ai.make.kernels -PKSU_NAME=kernels
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernels-${{ needs.check-release.outputs.tag }}-ai.make.kernels
+          path: source/manager/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save successfully built release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.check-release.outputs.tag }}
+        run: gh variable set LATEST_KERNELSU_RELEASE --body "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
